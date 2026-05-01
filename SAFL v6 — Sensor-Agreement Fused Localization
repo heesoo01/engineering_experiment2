@@ -1,0 +1,264 @@
+import numpy as np
+import pandas as pd
+from scipy.optimize import minimize
+import time
+
+# ============================================================
+# 설정
+# ============================================================
+
+TILE_TO_M = 0.6
+
+ANCHOR_INFO = [
+    ('110394ab', 'SW_11',          1,  4),
+    ('e63ce2f',  'SW_first_team', 20,  7),
+    ('8e610981', '볼링공',          5, 15),
+    ('d10485af', 'SW_4',           4, 27),
+    ('d1044709', 'SW_6',          15, 14),
+    ('4e610206', 'SW_5',          14, 24),
+]
+
+ANCHOR_XY = np.array([(x*TILE_TO_M, y*TILE_TO_M) for _,_,x,y in ANCHOR_INFO])
+
+UWB_COL_IDX  = [2, 3, 4, 5, 6, 7]
+WIFI_COL_IDX = [12, 8, 13, 9, 11, 10]
+
+# ── 통계 표준 상수 ───────────────────────────────────────────
+TUKEY_C     = 4.685
+IRWLS_ITER  = 3
+SCALE_FLOOR = 0.1
+
+# ── 앵커 기하학으로 자동 계산 ────────────────────────────────
+def compute_geometry(anchor_xy):
+    dists = [
+        np.linalg.norm(anchor_xy[i] - anchor_xy[j])
+        for i in range(len(anchor_xy))
+        for j in range(i+1, len(anchor_xy))
+    ]
+    max_dist = max(dists)
+    max_valid_dist = max_dist * 1.5
+    margin = max_dist * 0.15
+    bounds = [
+        (anchor_xy[:,0].min() - margin, anchor_xy[:,0].max() + margin),
+        (anchor_xy[:,1].min() - margin, anchor_xy[:,1].max() + margin),
+    ]
+    return max_valid_dist, bounds
+
+MAX_VALID_DIST, BOUNDS = compute_geometry(ANCHOR_XY)
+MIN_VALID_DIST = 0.1
+
+print(f"[자동 계산된 파라미터]")
+print(f"  최대 유효 거리 : {MAX_VALID_DIST:.2f} m")
+print(f"  추정 영역 X    : {BOUNDS[0][0]:.2f} ~ {BOUNDS[0][1]:.2f} m")
+print(f"  추정 영역 Y    : {BOUNDS[1][0]:.2f} ~ {BOUNDS[1][1]:.2f} m")
+
+
+# ============================================================
+# 핵심 알고리즘 — SAFL v6
+# ============================================================
+
+def estimate_position(anchors_xy, distances, variances, sensor_types):
+    """
+    Sensor-Agreement Fused Localization
+    
+    Stage 0:   물리적 불가능값 제거
+    Stage 1:   Sensor Agreement 계산 (anchor별 UWB-WiFi 일치도)
+    Stage 2:   분산 + Agreement 결합 가중치
+    Stage 3:   WLS 초기 추정
+    Stage 4:   IRWLS Tukey biweight 반복 보정
+    """
+    distances = np.array(distances, dtype=float)
+    variances = np.array(variances, dtype=float)
+    sensor_types = np.array(sensor_types)
+
+    # ===== Stage 0: 물리적으로 불가능한 값 제거 =====
+    valid = np.array([
+        not (np.isnan(d) or d < MIN_VALID_DIST or d > MAX_VALID_DIST)
+        for d in distances
+    ])
+
+    if valid.sum() < 3:
+        return None
+
+    # ===== Stage 1: Sensor Agreement 계산 (★ v6 핵심) =====
+    # 같은 anchor에서 UWB와 WiFi 측정이 일치하면 LOS 가능성 높음
+    # 차이가 크면 적어도 하나는 NLOS — 양쪽 다 신뢰도 감소
+    agreement_boost = np.ones(len(distances))
+    
+    for i in range(len(distances)):
+        if not valid[i]:
+            continue
+        for j in range(len(distances)):
+            if i == j or not valid[j]:
+                continue
+            # 같은 anchor (좌표 일치) + 다른 센서 종류
+            if (np.allclose(anchors_xy[i], anchors_xy[j]) and 
+                sensor_types[i] != sensor_types[j]):
+                diff = abs(distances[i] - distances[j])
+                # Gaussian agreement: 차이 작을수록 1에 가까움
+                agreement = np.exp(-diff**2 / 8.0)  # scale=2√2 m
+                # boost factor: 0.5x (불일치) ~ 2.0x (완전 일치)
+                agreement_boost[i] = 0.5 + 1.5 * agreement
+                break
+
+    # 필터링 적용
+    A  = anchors_xy[valid]
+    d  = distances[valid]
+    v  = variances[valid]
+    boost = agreement_boost[valid]
+    
+    v = np.where(np.isnan(v), 1.0, v)
+    v = np.clip(v, SCALE_FLOOR, None)
+
+    # ===== Stage 2: 분산 + Agreement 결합 가중치 =====
+    s2 = max(np.median(v), SCALE_FLOOR)
+    weights = (1.0 / (v + s2)) * boost   # ← agreement 반영
+
+    # ===== Stage 3: WLS 초기 추정 =====
+    def wls_loss(p, A, d, w):
+        return np.sum(w * (np.linalg.norm(A - p, axis=1) - d)**2)
+
+    centroid = np.clip(
+        A.mean(axis=0),
+        [BOUNDS[0][0], BOUNDS[1][0]],
+        [BOUNDS[0][1], BOUNDS[1][1]]
+    )
+    starts = [centroid] + [
+        np.clip(centroid + np.random.randn(2) * (MAX_VALID_DIST * 0.1),
+                [BOUNDS[0][0], BOUNDS[1][0]],
+                [BOUNDS[0][1], BOUNDS[1][1]])
+        for _ in range(4)
+    ]
+
+    best_pos, best_loss = None, np.inf
+    for start in starts:
+        try:
+            res = minimize(wls_loss, start, args=(A, d, weights),
+                           method='L-BFGS-B', bounds=BOUNDS,
+                           options={'maxiter': 300})
+            if res.fun < best_loss:
+                best_loss = res.fun
+                best_pos  = res.x
+        except Exception:
+            continue
+
+    if best_pos is None:
+        return None
+    p_hat = best_pos
+
+    # ===== Stage 4: IRWLS (Tukey biweight) =====
+    for _ in range(IRWLS_ITER):
+        residuals   = np.abs(np.linalg.norm(A - p_hat, axis=1) - d)
+        mad         = np.median(np.abs(residuals - np.median(residuals)))
+        scale       = max(1.4826 * mad, SCALE_FLOOR)
+        u           = residuals / (TUKEY_C * scale)
+        tukey_w     = np.where(np.abs(u) < 1, (1 - u**2)**2, 0.0)
+        new_weights = weights * tukey_w
+
+        if new_weights.sum() < 1e-6:
+            break
+        try:
+            res     = minimize(wls_loss, p_hat, args=(A, d, new_weights),
+                               method='L-BFGS-B', bounds=BOUNDS,
+                               options={'maxiter': 300})
+            p_hat   = res.x
+            weights = new_weights
+        except Exception:
+            break
+
+    return p_hat
+
+
+# ============================================================
+# 평가 (v5와 동일)
+# ============================================================
+
+def evaluate(median_path, variance_path, name="Dataset"):
+
+    df_med = pd.read_excel(median_path, header=None, skiprows=2)
+    df_var = pd.read_excel(variance_path, header=None, skiprows=2)
+
+    errors, times = [], []
+    skipped = 0
+
+    for idx in range(len(df_med)):
+        row_med = df_med.iloc[idx].values
+        row_var = df_var.iloc[idx].values
+
+        try:
+            true_x = float(row_med[0]) * TILE_TO_M
+            true_y = float(row_med[1]) * TILE_TO_M
+        except (ValueError, TypeError):
+            skipped += 1
+            continue
+
+        anchors_list, distances, variances, sensor_types = [], [], [], []
+
+        for i in range(6):
+            for col_idx, stype in [(UWB_COL_IDX[i], 'uwb'),
+                                   (WIFI_COL_IDX[i], 'wifi')]:
+                try:
+                    d_val = float(row_med[col_idx])
+                    v_val = float(row_var[col_idx])
+                except (ValueError, TypeError):
+                    d_val, v_val = np.nan, 1.0
+                anchors_list.append(ANCHOR_XY[i])
+                distances.append(d_val)
+                variances.append(v_val if not np.isnan(v_val) else 1.0)
+                sensor_types.append(stype)
+
+        A  = np.array(anchors_list)
+        d  = np.array(distances, dtype=float)
+        v  = np.array(variances, dtype=float)
+        st = np.array(sensor_types)
+
+        t0    = time.time()
+        p_hat = estimate_position(A, d, v, st)
+        times.append(time.time() - t0)
+
+        if p_hat is None:
+            skipped += 1
+            continue
+
+        errors.append(np.sqrt((p_hat[0]-true_x)**2 + (p_hat[1]-true_y)**2))
+
+    errors = np.array(errors)
+
+    print("=" * 55)
+    print(f"  {name}  (N={len(errors)}, 스킵={skipped})")
+    print("=" * 55)
+    print(f"  MAE          : {errors.mean():.4f} m")
+    print(f"  RMSE         : {np.sqrt((errors**2).mean()):.4f} m")
+    print(f"  최소 오차     : {errors.min():.4f} m")
+    print(f"  최대 오차     : {errors.max():.4f} m")
+    print(f"  50th pctile  : {np.percentile(errors, 50):.4f} m")
+    print(f"  75th pctile  : {np.percentile(errors, 75):.4f} m")
+    print(f"  90th pctile  : {np.percentile(errors, 90):.4f} m")
+    print(f"  2m 이내 비율  : {(errors < 2).mean()*100:.1f}%")
+    print(f"  3m 이내 비율  : {(errors < 3).mean()*100:.1f}%")
+    print(f"  평균 시간     : {np.mean(times)*1000:.2f} ms/sample")
+    print(f"  총 시간       : {np.sum(times):.2f} s")
+    print("=" * 55)
+
+    return errors
+
+
+# ============================================================
+# 실행
+# ============================================================
+
+np.random.seed(42)
+
+print("\n[Test set 평가]")
+test_errors = evaluate(
+    median_path='실험/median_test.xlsx',
+    variance_path='실험/variance_test.xlsx',
+    name="Test"
+)
+
+print("\n[Validation set 평가]")
+val_errors = evaluate(
+    median_path='실험/median_validation.xlsx',
+    variance_path='실험/variance_validation.xlsx',
+    name="Validation"
+)
